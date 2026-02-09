@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crawler"
+version = "1.0.0"
+description = "Python general-purpose web crawler"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.scripts]
+crawler = "crawler.cli:main"
+crawler-gui = "crawler.gui:main"
