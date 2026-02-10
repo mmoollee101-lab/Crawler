@@ -101,16 +101,18 @@ class KeywordAnalyzer:
             idf = math.log((n_docs + 1) / (df.get(token, 0) + 1)) + 1
             tfidf_scores[token] = tf_val * idf
 
-        # Combine scores: weight TF-IDF + co-occurrence
+        # Combine scores: weight TF-IDF (70%) + co-occurrence (30%)
         combined: dict[str, float] = {}
+        norm_values: dict[str, tuple[float, float]] = {}
         all_tokens = set(tfidf_scores.keys()) | set(co_occurrence.keys())
         max_tfidf = max(tfidf_scores.values()) if tfidf_scores else 1.0
         max_cooc = max(co_occurrence.values()) if co_occurrence else 1.0
 
         for token in all_tokens:
-            norm_tfidf = tfidf_scores.get(token, 0.0) / max_tfidf
-            norm_cooc = co_occurrence.get(token, 0) / max_cooc
-            combined[token] = 0.5 * norm_tfidf + 0.5 * norm_cooc
+            nt = tfidf_scores.get(token, 0.0) / max_tfidf
+            nc = co_occurrence.get(token, 0) / max_cooc
+            norm_values[token] = (nt, nc)
+            combined[token] = 0.7 * nt + 0.3 * nc
 
         # Sort and take top N
         top_keywords = sorted(combined.items(), key=lambda x: x[1], reverse=True)
@@ -118,12 +120,15 @@ class KeywordAnalyzer:
 
         related = []
         for token, score in top_keywords:
+            nt, nc = norm_values.get(token, (0.0, 0.0))
             related.append({
                 "keyword": token,
                 "frequency": global_tf.get(token, 0),
                 "co_occurrence": co_occurrence.get(token, 0),
                 "tfidf_score": round(tfidf_scores.get(token, 0.0), 4),
                 "combined_score": round(score, 4),
+                "norm_tfidf": round(nt, 6),
+                "norm_cooc": round(nc, 6),
             })
 
         return KeywordResult(

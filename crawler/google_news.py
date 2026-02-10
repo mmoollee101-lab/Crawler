@@ -32,14 +32,14 @@ _HEADERS_HTML = {
         "Chrome/131.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,ko-KR;q=0.8,ko;q=0.7",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": "https://www.google.com/",
 }
 
 _HEADERS_RSS = {
     "User-Agent": _HEADERS_HTML["User-Agent"],
     "Accept": "application/xml,text/xml,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,ko-KR;q=0.8,ko;q=0.7",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
 
@@ -143,6 +143,8 @@ class GoogleNewsCrawler:
             params = {
                 "q": self._keyword,
                 "tbm": "nws",
+                "hl": "ko",
+                "gl": "KR",
                 "num": str(_PAGE_SIZE),
                 "start": str(start),
                 "tbs": tbs,
@@ -310,7 +312,7 @@ class GoogleNewsCrawler:
         dt_from = _parse_date_str(self._start_date)
         dt_to = _parse_date_str(self._end_date) + timedelta(days=1)
 
-        params = {"q": self._keyword}
+        params = {"q": self._keyword, "hl": "ko", "gl": "KR", "ceid": "KR:ko"}
 
         try:
             resp = session.get(_RSS_URL, params=params, timeout=15)

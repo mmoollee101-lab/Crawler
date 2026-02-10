@@ -66,7 +66,9 @@ class KeywordVisualizer:
             [0.3 + 0.7 * (s / max(scores)) for s in scores]
         )
 
-        bars = ax.barh(words, scores, color=colors, edgecolor="#339af0", linewidth=0.5)
+        bars = ax.barh(words, scores, color=colors, edgecolor="#339af0", linewidth=0.5, picker=True)
+        for bar, word in zip(bars, words):
+            bar._keyword = word
 
         ax.set_xlabel("Relevance Score", fontsize=10)
         ax.set_title(f"Related Keywords: '{query}'", fontsize=13, fontweight="bold")
@@ -99,7 +101,9 @@ class KeywordVisualizer:
             [0.3 + 0.7 * (c / max_count) for c in counts]
         )
 
-        ax.bar(keywords, counts, color=colors, edgecolor="#e8590c", linewidth=0.5)
+        bars = ax.bar(keywords, counts, color=colors, edgecolor="#e8590c", linewidth=0.5, picker=True)
+        for bar, kw in zip(bars, keywords):
+            bar._keyword = kw
 
         ax.set_ylabel("Frequency", fontsize=10)
         ax.set_title("Detail Keyword Frequency (All Articles)", fontsize=13, fontweight="bold")

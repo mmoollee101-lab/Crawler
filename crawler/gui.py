@@ -18,10 +18,8 @@ if __name__ == "__main__" or __package__ is None:
 
 from .analyzer import KeywordAnalyzer
 from .article_fetcher import ArticleFetcher
-from .config import CrawlConfig
 from .detail_analyzer import DEFAULT_COMPANIES, DetailAnalyzer
-from .engine import CrawlEngine
-from .models import CrawlProgress, CrawlResult, KeywordResult, NewsArticle, PageData
+from .models import CrawlResult, KeywordResult, NewsArticle, PageData
 from .google_news import GoogleNewsCrawler
 from .naver_news import NaverNewsCrawler
 from .storage import Storage
@@ -38,6 +36,23 @@ class CrawlerGUI:
         self._root.geometry("1000x750")
         self._root.minsize(850, 650)
 
+        # Windows taskbar: show app's own icon instead of generic Python icon
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "crawler.keywordcrawler",
+            )
+        except Exception:
+            pass
+
+        # Window icon (supports PyInstaller frozen mode via sys._MEIPASS)
+        _icon_path = os.path.join(
+            getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
+            "icon.ico",
+        )
+        if os.path.exists(_icon_path):
+            self._root.iconbitmap(_icon_path)
+
         self._msg_queue: queue.Queue = queue.Queue()
         self._cancel_event = threading.Event()
         self._crawl_thread: threading.Thread | None = None
@@ -50,10 +65,18 @@ class CrawlerGUI:
         self._detail_result: dict | None = None
         self._detail_graph_canvas = None
 
+        # Hidden keywords state (right-click to hide)
+        self._hidden_keywords: set[str] = set()
+
+        # Score weight for combined ranking (0-100 = TF-IDF percentage)
+        self._tfidf_weight_var = tk.IntVar(value=70)
+
         # Article popup state
         self._article_popup: tk.Toplevel | None = None
         self._popup_tree: ttk.Treeview | None = None
         self._popup_info_label: ttk.Label | None = None
+        self._popup_sort_col: str = ""
+        self._popup_sort_reverse: bool = False
 
         self._build_ui()
         self._on_mode_change()  # set initial field states
@@ -79,19 +102,15 @@ class CrawlerGUI:
         row0.pack(fill="x", pady=2)
 
         ttk.Label(row0, text="Mode:").pack(side="left")
-        self._mode_var = tk.StringVar(value="naver")
-        ttk.Radiobutton(
-            row0, text="Naver News", variable=self._mode_var,
-            value="naver", command=self._on_mode_change,
-        ).pack(side="left", padx=(5, 5))
+        self._mode_var = tk.StringVar(value="google")
         ttk.Radiobutton(
             row0, text="Google News", variable=self._mode_var,
             value="google", command=self._on_mode_change,
-        ).pack(side="left", padx=(0, 5))
+        ).pack(side="left", padx=(5, 5))
         ttk.Radiobutton(
-            row0, text="General Crawl", variable=self._mode_var,
-            value="general", command=self._on_mode_change,
-        ).pack(side="left", padx=(0, 20))
+            row0, text="Naver News", variable=self._mode_var,
+            value="naver", command=self._on_mode_change,
+        ).pack(side="left", padx=(0, 15))
 
         ttk.Label(row0, text="Keyword:").pack(side="left")
         self._keyword_var = tk.StringVar()
@@ -103,16 +122,7 @@ class CrawlerGUI:
         self._dynamic = ttk.Frame(frame)
         self._dynamic.pack(fill="x")
 
-        # Row 1 (General): URL
-        self._row_url = ttk.Frame(self._dynamic)
-        ttk.Label(self._row_url, text="URL:").pack(side="left")
-        self._url_var = tk.StringVar(value="https://")
-        self._url_entry = ttk.Entry(
-            self._row_url, textvariable=self._url_var, width=70,
-        )
-        self._url_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-
-        # Row 2 (Naver): Date range only (no Max Results)
+        # Row: Date range (for Naver/Google news modes)
         self._row_naver = ttk.Frame(self._dynamic)
 
         today = datetime.now()
@@ -130,40 +140,7 @@ class CrawlerGUI:
             side="left", padx=(5, 0),
         )
 
-        # Row 3 (General): Depth, pages, checkboxes
-        self._row_general = ttk.Frame(self._dynamic)
-        self._row_general.pack(fill="x", pady=2)
-
-        ttk.Label(self._row_general, text="Max Depth:").pack(side="left")
-        self._depth_var = tk.IntVar(value=2)
-        ttk.Spinbox(
-            self._row_general, textvariable=self._depth_var,
-            from_=0, to=10, width=5,
-        ).pack(side="left", padx=(5, 15))
-
-        ttk.Label(self._row_general, text="Max Pages:").pack(side="left")
-        self._pages_var = tk.IntVar(value=50)
-        ttk.Spinbox(
-            self._row_general, textvariable=self._pages_var,
-            from_=1, to=10000, width=7,
-        ).pack(side="left", padx=(5, 15))
-
-        self._same_domain_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            self._row_general, text="Same Domain", variable=self._same_domain_var,
-        ).pack(side="left", padx=(0, 10))
-
-        self._robots_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            self._row_general, text="Respect robots.txt", variable=self._robots_var,
-        ).pack(side="left")
-
-        self._headlines_only_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            self._row_general, text="Headlines Only", variable=self._headlines_only_var,
-        ).pack(side="left", padx=(10, 0))
-
-        # Row 4: Buttons + progress
+        # Row: Buttons + progress
         row4 = ttk.Frame(frame)
         row4.pack(fill="x", pady=(5, 0))
 
@@ -186,50 +163,14 @@ class CrawlerGUI:
 
     def _on_mode_change(self) -> None:
         """Show/hide settings rows based on selected mode."""
-        self._row_url.pack_forget()
         self._row_naver.pack_forget()
-        self._row_general.pack_forget()
-
-        if self._mode_var.get() in ("naver", "google"):
-            self._row_naver.pack(fill="x", pady=2)
-        else:
-            self._row_url.pack(fill="x", pady=2)
-            self._row_general.pack(fill="x", pady=2)
+        self._row_naver.pack(fill="x", pady=2)
 
     def _build_notebook(self) -> None:
         self._notebook = ttk.Notebook(self._root)
         self._notebook.pack(fill="both", expand=True, padx=10, pady=5)
 
-        # Tab 1: Crawl Log
-        log_frame = ttk.Frame(self._notebook)
-        self._notebook.add(log_frame, text="Crawl Log")
-
-        columns = ("#", "URL", "Title", "Status", "Depth")
-        self._log_tree = ttk.Treeview(
-            log_frame, columns=columns, show="headings", height=15,
-        )
-        self._log_tree.heading("#", text="#")
-        self._log_tree.heading("URL", text="URL")
-        self._log_tree.heading("Title", text="Title")
-        self._log_tree.heading("Status", text="Status")
-        self._log_tree.heading("Depth", text="Depth")
-
-        self._log_tree.column("#", width=40, stretch=False)
-        self._log_tree.column("URL", width=350, stretch=True)
-        self._log_tree.column("Title", width=300, stretch=True)
-        self._log_tree.column("Status", width=60, stretch=False)
-        self._log_tree.column("Depth", width=50, stretch=False)
-
-        log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self._log_tree.yview)
-        self._log_tree.configure(yscrollcommand=log_sb.set)
-        self._log_tree.tag_configure("blocked", foreground="#cc6600")
-        self._log_tree.tag_configure("failed", foreground="#cc0000")
-        self._log_tree.tag_configure("crawled", foreground="#000000")
-
-        self._log_tree.pack(side="left", fill="both", expand=True)
-        log_sb.pack(side="right", fill="y")
-
-        # Tab 2: Headlines
+        # Tab 1: Headlines
         hl_frame = ttk.Frame(self._notebook)
         self._notebook.add(hl_frame, text="Headlines")
 
@@ -263,7 +204,7 @@ class CrawlerGUI:
         hl_sb.pack(side="right", fill="y", pady=(0, 5))
         self._hl_tree.bind("<Double-1>", self._on_article_double_click)
 
-        # Tab 3: Keywords
+        # Tab 2: Keywords
         kw_frame = ttk.Frame(self._notebook)
         self._notebook.add(kw_frame, text="Keywords")
 
@@ -301,8 +242,9 @@ class CrawlerGUI:
         self._kw_tree.pack(side="left", fill="both", expand=True, padx=(5, 0), pady=(0, 5))
         kw_sb.pack(side="right", fill="y", pady=(0, 5))
         self._kw_tree.bind("<<TreeviewSelect>>", self._on_keyword_select)
+        self._kw_tree.bind("<Button-3>", self._on_kw_right_click)
 
-        # Tab 4: Detail Analysis
+        # Tab 3: Detail Analysis
         detail_frame = ttk.Frame(self._notebook)
         self._notebook.add(detail_frame, text="Detail Analysis")
 
@@ -386,7 +328,7 @@ class CrawlerGUI:
         self._detail_tree.bind("<Button-1>", self._on_detail_cell_click)
         self._detail_tree.bind("<Double-1>", self._on_detail_double_click)
 
-        # Tab 5: Graph (bar chart only)
+        # Tab 4: Graph (bar chart only)
         graph_frame = ttk.Frame(self._notebook)
         self._notebook.add(graph_frame, text="Graph")
 
@@ -396,10 +338,30 @@ class CrawlerGUI:
             graph_controls, text="Save Graph PNG", command=self._save_graph,
         ).pack(side="right", padx=5)
 
+        ttk.Label(graph_controls, text="Score Weight:").pack(side="left")
+        self._weight_scale = ttk.Scale(
+            graph_controls, from_=0, to=100,
+            variable=self._tfidf_weight_var,
+            command=self._on_weight_slider_move,
+        )
+        self._weight_scale.pack(side="left", padx=5, fill="x", expand=True)
+        self._weight_scale.bind("<ButtonRelease-1>", lambda e: self._on_weight_change())
+        self._weight_label = ttk.Label(
+            graph_controls, text="TF-IDF 70% / Co-occ 30%", width=24,
+        )
+        self._weight_label.pack(side="left")
+
+        ttk.Label(
+            graph_frame,
+            text="  TF-IDF = word importance across articles  |"
+                 "  Co-occurrence = appears alongside search keyword",
+            font=("", 8), foreground="gray",
+        ).pack(fill="x", padx=5, pady=(0, 2))
+
         self._graph_container = ttk.Frame(graph_frame)
         self._graph_container.pack(fill="both", expand=True, padx=5, pady=(0, 5))
 
-        # Tab 6: History
+        # Tab 5: History
         hist_frame = ttk.Frame(self._notebook)
         self._notebook.add(hist_frame, text="History")
 
@@ -456,15 +418,9 @@ class CrawlerGUI:
             return
 
         mode = self._mode_var.get()
-        if mode == "general":
-            url = self._url_var.get().strip()
-            if not url or url == "https://":
-                messagebox.showwarning("Input Required", "Please enter a URL.")
-                return
 
         # Clear previous results
-        self._log_row_count = 0
-        for tree in (self._log_tree, self._hl_tree, self._kw_tree):
+        for tree in (self._hl_tree, self._kw_tree):
             for item in tree.get_children():
                 tree.delete(item)
         self._clear_graph()
@@ -492,12 +448,6 @@ class CrawlerGUI:
             self._crawl_thread = threading.Thread(
                 target=self._google_worker, daemon=True,
             )
-        else:
-            url = self._url_var.get().strip()
-            self._status_var.set(f"Crawling {url} ...")
-            self._crawl_thread = threading.Thread(
-                target=self._general_worker, daemon=True,
-            )
         self._crawl_thread.start()
 
     def _on_stop(self) -> None:
@@ -506,27 +456,6 @@ class CrawlerGUI:
         self._stop_btn.configure(state="disabled")
 
     # ── Workers ──────────────────────────────────────────────────
-
-    def _general_worker(self) -> None:
-        """General crawl in background thread."""
-        try:
-            config = CrawlConfig(
-                seed_url=self._url_var.get().strip(),
-                max_depth=self._depth_var.get(),
-                max_pages=self._pages_var.get(),
-                same_domain=self._same_domain_var.get(),
-                respect_robots=self._robots_var.get(),
-                keyword=self._keyword_var.get().strip(),
-            )
-            engine = CrawlEngine(
-                config,
-                progress_callback=lambda p: self._msg_queue.put(("progress", p)),
-                cancel_event=self._cancel_event,
-            )
-            result = engine.run()
-            self._msg_queue.put(("done", result))
-        except Exception as e:
-            self._msg_queue.put(("error", str(e)))
 
     def _naver_worker(self) -> None:
         """Naver News search in background thread."""
@@ -569,11 +498,7 @@ class CrawlerGUI:
         try:
             while True:
                 msg_type, data = self._msg_queue.get_nowait()
-                if msg_type == "progress":
-                    self._handle_progress(data)
-                elif msg_type == "done":
-                    self._handle_done(data)
-                elif msg_type == "naver_progress":
+                if msg_type == "naver_progress":
                     self._handle_naver_progress(*data)
                 elif msg_type == "naver_done":
                     self._handle_naver_done(data)
@@ -586,102 +511,6 @@ class CrawlerGUI:
         except queue.Empty:
             pass
         self._root.after(100, self._poll_queue)
-
-    # ── General crawl handlers ───────────────────────────────────
-
-    def _handle_progress(self, progress: CrawlProgress) -> None:
-        pct = (progress.pages_crawled / progress.max_pages * 100) if progress.max_pages else 0
-        self._progress_var.set(pct)
-        self._progress_label.configure(text=f"{int(pct)}%")
-
-        event = progress.event_type
-        if event == "blocked":
-            status_text = "BLOCKED"
-            status_msg = f"[robots.txt] {progress.current_url}"
-        elif event == "failed":
-            status_text = f"FAIL({progress.status_code})"
-            status_msg = f"[FAIL {progress.status_code}] {progress.current_url}"
-        else:
-            status_text = str(progress.status_code)
-            status_msg = (
-                f"[{progress.pages_crawled}/{progress.max_pages}] "
-                f"depth={progress.current_depth}  {progress.current_url}"
-            )
-
-        self._status_var.set(status_msg)
-        self._log_row_count = getattr(self, "_log_row_count", 0) + 1
-
-        self._log_tree.insert("", "end", values=(
-            self._log_row_count,
-            progress.current_url,
-            progress.current_title or "(no title)",
-            status_text,
-            progress.current_depth,
-        ), tags=(event,))
-
-        children = self._log_tree.get_children()
-        if children:
-            self._log_tree.see(children[-1])
-
-    def _handle_done(self, result: CrawlResult) -> None:
-        self._crawl_result = result
-        self._start_btn.configure(state="normal")
-        self._stop_btn.configure(state="disabled")
-
-        cancelled = self._cancel_event.is_set()
-        status = "Cancelled" if cancelled else "Complete"
-
-        if result.total_crawled == 0:
-            self._progress_var.set(0)
-            self._progress_label.configure(text="0%")
-            self._status_var.set(f"Crawl {status}: 0 pages (check robots.txt or URL)")
-            messagebox.showwarning(
-                "No Pages Crawled",
-                f"Crawl {status}: 0 pages.\n\n"
-                "Try unchecking 'Respect robots.txt' or using a different URL.",
-            )
-            return
-
-        self._progress_var.set(100)
-        self._progress_label.configure(text="100%")
-
-        # Populate headlines tab (general mode)
-        row = 0
-        for page in result.pages:
-            for hl in page.headlines:
-                row += 1
-                self._hl_tree.insert("", "end", values=(row, hl, "", "", page.url))
-        self._hl_info_label.configure(
-            text=f"Headlines: {row} titles from {result.total_crawled} pages",
-        )
-
-        # Keyword analysis
-        keyword = self._keyword_var.get().strip()
-        headlines_only = self._headlines_only_var.get()
-        if keyword and result.pages:
-            analyzer = KeywordAnalyzer()
-            self._keyword_result = analyzer.analyze(
-                result.pages, keyword, headlines_only=headlines_only,
-            )
-            self._populate_keywords()
-            self._refresh_graph()
-            mode = "headlines" if headlines_only else "full text"
-            self._status_var.set(
-                f"Crawl {status}: {result.total_crawled} pages | "
-                f"Keywords ({mode}): {len(self._keyword_result.related_keywords)} found"
-            )
-
-            # Save to history
-            self._save_history_record(
-                mode="General",
-                keyword=keyword,
-                period=self._url_var.get().strip(),
-                article_count=result.total_crawled,
-            )
-        else:
-            self._status_var.set(
-                f"Crawl {status}: {result.total_crawled} pages, {result.total_failed} failed"
-            )
 
     # ── Naver News handlers ──────────────────────────────────────
 
@@ -700,6 +529,7 @@ class CrawlerGUI:
         # Store articles for detail analysis
         self._naver_articles = list(articles)
         self._detail_result = None
+        self._hidden_keywords.clear()
 
         cancelled = self._cancel_event.is_set()
 
@@ -720,7 +550,7 @@ class CrawlerGUI:
         self._hl_info_label.configure(text=f"{mode_label}: {len(articles)} articles found")
 
         # Switch to Headlines tab automatically
-        self._notebook.select(1)
+        self._notebook.select(0)
 
         # Convert articles to PageData for keyword analysis
         pages: list[PageData] = []
@@ -786,9 +616,9 @@ class CrawlerGUI:
                  f"Pages with query: {self._keyword_result.pages_containing_query}",
         )
 
-        for i, kw in enumerate(self._keyword_result.related_keywords, 1):
+        for rank, kw in enumerate(self._get_weighted_keywords(), 1):
             self._kw_tree.insert("", "end", values=(
-                i,
+                rank,
                 kw["keyword"],
                 kw["frequency"],
                 kw["co_occurrence"],
@@ -831,13 +661,21 @@ class CrawlerGUI:
 
         from .visualizer import KeywordVisualizer
 
+        filtered_keywords = self._get_weighted_keywords()
+        if not filtered_keywords:
+            ttk.Label(
+                self._graph_container, text="All keywords hidden.", font=("", 12),
+            ).pack(expand=True)
+            return
+
         viz = KeywordVisualizer()
         fig = viz.create_bar_chart(
             self._keyword_result.query_keyword,
-            self._keyword_result.related_keywords,
+            filtered_keywords,
         )
         self._graph_canvas = viz.embed_in_tkinter(fig, self._graph_container)
         self._graph_canvas.mpl_connect("pick_event", self._on_graph_pick)
+        self._graph_canvas.mpl_connect("button_press_event", self._on_graph_button_press)
 
     def _save_graph(self) -> None:
         if not self._graph_canvas:
@@ -849,6 +687,34 @@ class CrawlerGUI:
         self._graph_canvas.figure.savefig(path, dpi=150, bbox_inches="tight")
         self._status_var.set(f"Graph saved: {path}")
         messagebox.showinfo("Saved", f"Graph saved to {path}")
+
+    def _on_weight_slider_move(self, value: str) -> None:
+        """Update weight label while dragging slider."""
+        w = int(float(value))
+        self._weight_label.configure(text=f"TF-IDF {w}% / Co-occ {100 - w}%")
+
+    def _on_weight_change(self) -> None:
+        """Refresh graph and keywords table after weight adjustment."""
+        self._populate_keywords()
+        self._refresh_graph()
+
+    def _get_weighted_keywords(self) -> list[dict]:
+        """Return keywords recomputed/sorted by current weight, excluding hidden."""
+        if not self._keyword_result:
+            return []
+        w = self._tfidf_weight_var.get() / 100.0
+        cw = 1.0 - w
+        result = []
+        for kw in self._keyword_result.related_keywords:
+            if kw["keyword"] in self._hidden_keywords:
+                continue
+            updated = dict(kw)
+            nt = kw.get("norm_tfidf", 0.0)
+            nc = kw.get("norm_cooc", 0.0)
+            updated["combined_score"] = round(w * nt + cw * nc, 4)
+            result.append(updated)
+        result.sort(key=lambda x: x["combined_score"], reverse=True)
+        return result
 
     # ── History tab ──────────────────────────────────────────────
 
@@ -1157,6 +1023,82 @@ class CrawlerGUI:
                     webbrowser.open(url)
                 return
 
+    # ── Right-click keyword hiding ──────────────────────────────
+
+    def _on_kw_right_click(self, event: tk.Event) -> None:
+        """Keywords tab: right-click to hide a keyword."""
+        row_id = self._kw_tree.identify_row(event.y)
+        if not row_id:
+            return
+        values = self._kw_tree.item(row_id, "values")
+        keyword = values[1] if len(values) > 1 else ""
+        if not keyword:
+            return
+
+        menu = tk.Menu(self._root, tearoff=0)
+        menu.add_command(
+            label=f"Hide '{keyword}'",
+            command=lambda: self._hide_keyword(keyword),
+        )
+        if self._hidden_keywords:
+            menu.add_command(
+                label=f"Show All Hidden ({len(self._hidden_keywords)})",
+                command=self._show_all_keywords,
+            )
+        menu.add_separator()
+        menu.add_command(label="Cancel")
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_graph_button_press(self, event) -> None:
+        """Graph tab: right-click (button 3) a bar to hide that keyword."""
+        if event.button != 3 or not self._graph_canvas:
+            return
+
+        ax = self._graph_canvas.figure.axes[0] if self._graph_canvas.figure.axes else None
+        if not ax:
+            return
+
+        keyword = None
+        for bar in ax.patches:
+            contains, _ = bar.contains(event)
+            if contains:
+                keyword = getattr(bar, "_keyword", None)
+                break
+
+        if not keyword:
+            return
+
+        # Get screen coordinates from the tkinter widget
+        widget = self._graph_canvas.get_tk_widget()
+        x_root = widget.winfo_rootx() + int(event.x)
+        y_root = widget.winfo_rooty() + widget.winfo_height() - int(event.y)
+
+        menu = tk.Menu(self._root, tearoff=0)
+        menu.add_command(
+            label=f"Hide '{keyword}'",
+            command=lambda: self._hide_keyword(keyword),
+        )
+        if self._hidden_keywords:
+            menu.add_command(
+                label=f"Show All Hidden ({len(self._hidden_keywords)})",
+                command=self._show_all_keywords,
+            )
+        menu.add_separator()
+        menu.add_command(label="Cancel")
+        menu.tk_popup(x_root, y_root)
+
+    def _hide_keyword(self, keyword: str) -> None:
+        """Add keyword to hidden set and refresh views."""
+        self._hidden_keywords.add(keyword)
+        self._populate_keywords()
+        self._refresh_graph()
+
+    def _show_all_keywords(self) -> None:
+        """Clear all hidden keywords and refresh views."""
+        self._hidden_keywords.clear()
+        self._populate_keywords()
+        self._refresh_graph()
+
     def _on_popup_article_double_click(self, event: tk.Event) -> None:
         """Popup: double-click article opens URL in browser."""
         if not self._popup_tree:
@@ -1189,11 +1131,11 @@ class CrawlerGUI:
         self._popup_tree = ttk.Treeview(
             container, columns=popup_columns, show="headings", height=15,
         )
-        self._popup_tree.heading("#", text="#")
-        self._popup_tree.heading("Title", text="Title")
-        self._popup_tree.heading("Source", text="Source")
-        self._popup_tree.heading("Date", text="Date")
-        self._popup_tree.heading("URL", text="URL")
+        for col in popup_columns:
+            self._popup_tree.heading(
+                col, text=col,
+                command=lambda c=col: self._sort_popup(c),
+            )
 
         self._popup_tree.column("#", width=35, stretch=False)
         self._popup_tree.column("Title", width=300, stretch=True)
@@ -1218,6 +1160,40 @@ class CrawlerGUI:
             self._popup_tree = None
             self._popup_info_label = None
 
+    def _sort_popup(self, col: str) -> None:
+        """Sort the article popup table by clicked column."""
+        if not self._popup_tree:
+            return
+
+        if col == self._popup_sort_col:
+            self._popup_sort_reverse = not self._popup_sort_reverse
+        else:
+            self._popup_sort_col = col
+            self._popup_sort_reverse = False
+
+        col_index = {"#": 0, "Title": 1, "Source": 2, "Date": 3, "URL": 4}
+        idx = col_index.get(col, 0)
+
+        items = []
+        for item_id in self._popup_tree.get_children():
+            items.append(self._popup_tree.item(item_id, "values"))
+
+        if col == "#":
+            items.sort(key=lambda x: int(x[0]), reverse=self._popup_sort_reverse)
+        else:
+            items.sort(key=lambda x: x[idx], reverse=self._popup_sort_reverse)
+
+        for item_id in self._popup_tree.get_children():
+            self._popup_tree.delete(item_id)
+        for vals in items:
+            self._popup_tree.insert("", "end", values=vals)
+
+        # Update heading with arrow indicator
+        arrow = "\u25bc" if self._popup_sort_reverse else "\u25b2"
+        for c in ("#", "Title", "Source", "Date", "URL"):
+            self._popup_tree.heading(c, text=c)
+        self._popup_tree.heading(col, text=f"{col} {arrow}")
+
     def _show_articles_for_keyword(self, keyword: str) -> None:
         """Show popup with articles matching the given keyword."""
         # Reuse existing popup or create new one
@@ -1225,6 +1201,12 @@ class CrawlerGUI:
             self._create_article_popup()
 
         self._article_popup.title(f"Articles containing: {keyword}")
+
+        # Reset sort state
+        self._popup_sort_col = ""
+        self._popup_sort_reverse = False
+        for col in ("#", "Title", "Source", "Date", "URL"):
+            self._popup_tree.heading(col, text=col)
 
         # Clear existing rows
         for item in self._popup_tree.get_children():
@@ -1253,8 +1235,7 @@ class CrawlerGUI:
 
         Priority:
         1. Detail result with precomputed counts
-        2. Naver articles (substring search)
-        3. General crawl pages (substring search)
+        2. News articles (substring search)
         """
         kw_lower = keyword.lower()
 
@@ -1289,20 +1270,6 @@ class CrawlerGUI:
                         "source": art.source,
                         "date": art.date,
                         "url": art.link,
-                    })
-            return matches
-
-        # Path 3: General crawl pages
-        if self._crawl_result and self._crawl_result.pages:
-            matches = []
-            for page in self._crawl_result.pages:
-                text = (page.full_text or "").lower()
-                if kw_lower in text:
-                    matches.append({
-                        "title": page.title or "(no title)",
-                        "source": "",
-                        "date": "",
-                        "url": page.url,
                     })
             return matches
 
