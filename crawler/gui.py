@@ -7,6 +7,7 @@ import sys
 import queue
 import threading
 import tkinter as tk
+import webbrowser
 from datetime import datetime, timedelta
 from tkinter import ttk, messagebox
 
@@ -21,6 +22,7 @@ from .config import CrawlConfig
 from .detail_analyzer import DEFAULT_COMPANIES, DetailAnalyzer
 from .engine import CrawlEngine
 from .models import CrawlProgress, CrawlResult, KeywordResult, NewsArticle, PageData
+from .google_news import GoogleNewsCrawler
 from .naver_news import NaverNewsCrawler
 from .storage import Storage
 
@@ -47,6 +49,11 @@ class CrawlerGUI:
         self._naver_articles: list[NewsArticle] = []
         self._detail_result: dict | None = None
         self._detail_graph_canvas = None
+
+        # Article popup state
+        self._article_popup: tk.Toplevel | None = None
+        self._popup_tree: ttk.Treeview | None = None
+        self._popup_info_label: ttk.Label | None = None
 
         self._build_ui()
         self._on_mode_change()  # set initial field states
@@ -77,6 +84,10 @@ class CrawlerGUI:
             row0, text="Naver News", variable=self._mode_var,
             value="naver", command=self._on_mode_change,
         ).pack(side="left", padx=(5, 5))
+        ttk.Radiobutton(
+            row0, text="Google News", variable=self._mode_var,
+            value="google", command=self._on_mode_change,
+        ).pack(side="left", padx=(0, 5))
         ttk.Radiobutton(
             row0, text="General Crawl", variable=self._mode_var,
             value="general", command=self._on_mode_change,
@@ -179,7 +190,7 @@ class CrawlerGUI:
         self._row_naver.pack_forget()
         self._row_general.pack_forget()
 
-        if self._mode_var.get() == "naver":
+        if self._mode_var.get() in ("naver", "google"):
             self._row_naver.pack(fill="x", pady=2)
         else:
             self._row_url.pack(fill="x", pady=2)
@@ -250,6 +261,7 @@ class CrawlerGUI:
 
         self._hl_tree.pack(side="left", fill="both", expand=True, padx=(5, 0), pady=(0, 5))
         hl_sb.pack(side="right", fill="y", pady=(0, 5))
+        self._hl_tree.bind("<Double-1>", self._on_article_double_click)
 
         # Tab 3: Keywords
         kw_frame = ttk.Frame(self._notebook)
@@ -288,6 +300,7 @@ class CrawlerGUI:
 
         self._kw_tree.pack(side="left", fill="both", expand=True, padx=(5, 0), pady=(0, 5))
         kw_sb.pack(side="right", fill="y", pady=(0, 5))
+        self._kw_tree.bind("<<TreeviewSelect>>", self._on_keyword_select)
 
         # Tab 4: Detail Analysis
         detail_frame = ttk.Frame(self._notebook)
@@ -348,7 +361,7 @@ class CrawlerGUI:
 
         self._detail_info_label = ttk.Label(
             detail_results,
-            text="Run a Naver News search first, then click 'Fetch Articles & Analyze'.",
+            text="Run a News search first, then click 'Fetch Articles & Analyze'.",
         )
         self._detail_info_label.pack(anchor="w", pady=(0, 3))
 
@@ -370,6 +383,8 @@ class CrawlerGUI:
         self._detail_tree.pack(side="left", fill="both", expand=True)
         detail_ysb.pack(side="right", fill="y")
         detail_xsb.pack(fill="x")
+        self._detail_tree.bind("<Button-1>", self._on_detail_cell_click)
+        self._detail_tree.bind("<Double-1>", self._on_detail_double_click)
 
         # Tab 5: Graph (bar chart only)
         graph_frame = ttk.Frame(self._notebook)
@@ -472,6 +487,11 @@ class CrawlerGUI:
             self._crawl_thread = threading.Thread(
                 target=self._naver_worker, daemon=True,
             )
+        elif mode == "google":
+            self._status_var.set(f"Searching Google News: '{keyword}' ...")
+            self._crawl_thread = threading.Thread(
+                target=self._google_worker, daemon=True,
+            )
         else:
             url = self._url_var.get().strip()
             self._status_var.set(f"Crawling {url} ...")
@@ -515,6 +535,24 @@ class CrawlerGUI:
                 keyword=self._keyword_var.get().strip(),
                 start_date=self._date_from_var.get().strip(),
                 end_date=self._date_to_var.get().strip(),
+                progress_callback=lambda c, m, t: self._msg_queue.put(
+                    ("naver_progress", (c, m, t)),
+                ),
+                cancel_event=self._cancel_event,
+            )
+            articles = crawler.crawl()
+            self._msg_queue.put(("naver_done", articles))
+        except Exception as e:
+            self._msg_queue.put(("error", str(e)))
+
+    def _google_worker(self) -> None:
+        """Google News search in background thread."""
+        try:
+            crawler = GoogleNewsCrawler(
+                keyword=self._keyword_var.get().strip(),
+                start_date=self._date_from_var.get().strip(),
+                end_date=self._date_to_var.get().strip(),
+                delay=1.0,
                 progress_callback=lambda c, m, t: self._msg_queue.put(
                     ("naver_progress", (c, m, t)),
                 ),
@@ -677,7 +715,9 @@ class CrawlerGUI:
             self._hl_tree.insert("", "end", values=(
                 i, art.title, art.source, art.date, art.link,
             ))
-        self._hl_info_label.configure(text=f"Naver News: {len(articles)} articles found")
+        mode = self._mode_var.get()
+        mode_label = "Google News" if mode == "google" else "Naver News"
+        self._hl_info_label.configure(text=f"{mode_label}: {len(articles)} articles found")
 
         # Switch to Headlines tab automatically
         self._notebook.select(1)
@@ -694,7 +734,8 @@ class CrawlerGUI:
             ))
 
         # Build a CrawlResult so exports work
-        self._crawl_result = CrawlResult(seed_url="naver_news_search", pages=pages)
+        seed = "google_news_search" if mode == "google" else "naver_news_search"
+        self._crawl_result = CrawlResult(seed_url=seed, pages=pages)
 
         # Keyword analysis (always headlines mode for Naver)
         keyword = self._keyword_var.get().strip()
@@ -707,15 +748,16 @@ class CrawlerGUI:
         status = "Cancelled" if cancelled else "Complete"
         kw_count = len(self._keyword_result.related_keywords) if self._keyword_result else 0
         self._status_var.set(
-            f"Naver News {status}: {len(articles)} articles | "
+            f"{mode_label} {status}: {len(articles)} articles | "
             f"Keywords: {kw_count} found"
         )
 
         # Save to history
+        history_mode = "Google" if mode == "google" else "Naver"
         date_from = self._date_from_var.get().strip()
         date_to = self._date_to_var.get().strip()
         self._save_history_record(
-            mode="Naver",
+            mode=history_mode,
             keyword=keyword,
             period=f"{date_from} ~ {date_to}",
             article_count=len(articles),
@@ -795,6 +837,7 @@ class CrawlerGUI:
             self._keyword_result.related_keywords,
         )
         self._graph_canvas = viz.embed_in_tkinter(fig, self._graph_container)
+        self._graph_canvas.mpl_connect("pick_event", self._on_graph_pick)
 
     def _save_graph(self) -> None:
         if not self._graph_canvas:
@@ -871,7 +914,7 @@ class CrawlerGUI:
         if not self._naver_articles:
             messagebox.showwarning(
                 "No Articles",
-                "Run a Naver News search first to collect articles.",
+                "Run a Naver or Google News search first to collect articles.",
             )
             return
 
@@ -1035,6 +1078,235 @@ class CrawlerGUI:
         viz = KeywordVisualizer()
         fig = viz.create_detail_bar_chart(result["totals"])
         self._graph_canvas = viz.embed_in_tkinter(fig, self._graph_container)
+        self._graph_canvas.mpl_connect("pick_event", self._on_graph_pick)
+
+    # ── Keyword-Article mapping & URL open ─────────────────────
+
+    def _on_graph_pick(self, event) -> None:
+        """Graph tab: click a bar to show articles for that keyword."""
+        keyword = getattr(event.artist, "_keyword", None)
+        if keyword:
+            self._show_articles_for_keyword(keyword)
+
+    def _on_article_double_click(self, event: tk.Event) -> None:
+        """Headlines tab: double-click opens article URL in browser."""
+        item = self._hl_tree.identify_row(event.y)
+        if not item:
+            return
+        values = self._hl_tree.item(item, "values")
+        url = values[4] if len(values) > 4 else ""
+        if url:
+            webbrowser.open(url)
+
+    def _on_keyword_select(self, event: tk.Event) -> None:
+        """Keywords tab: selecting a keyword shows matching articles."""
+        selection = self._kw_tree.selection()
+        if not selection:
+            return
+        values = self._kw_tree.item(selection[0], "values")
+        keyword = values[1] if len(values) > 1 else ""
+        if keyword:
+            self._show_articles_for_keyword(keyword)
+
+    def _on_detail_cell_click(self, event: tk.Event) -> None:
+        """Detail tab: click on a keyword column header/cell shows articles."""
+        region = self._detail_tree.identify_region(event.x, event.y)
+        col_id = self._detail_tree.identify_column(event.x)
+        if not col_id:
+            return
+
+        # Convert column identifier (#1, #2, ...) to column name
+        try:
+            col_index = int(col_id.replace("#", "")) - 1
+        except ValueError:
+            return
+        columns = self._detail_tree["columns"]
+        if col_index < 0 or col_index >= len(columns):
+            return
+        col_name = columns[col_index]
+
+        # Only respond to keyword columns (not #, Title, or Total)
+        if col_name in ("#", "Title", "Total"):
+            return
+
+        if region == "heading":
+            self._show_articles_for_keyword(col_name)
+        elif region == "cell":
+            item = self._detail_tree.identify_row(event.y)
+            if item and "totals" not in self._detail_tree.item(item, "tags"):
+                self._show_articles_for_keyword(col_name)
+
+    def _on_detail_double_click(self, event: tk.Event) -> None:
+        """Detail tab: double-click article row opens its URL in browser."""
+        item = self._detail_tree.identify_row(event.y)
+        if not item:
+            return
+        if "totals" in self._detail_tree.item(item, "tags"):
+            return
+        if not self._detail_result:
+            return
+
+        values = self._detail_tree.item(item, "values")
+        title = values[1] if len(values) > 1 else ""
+
+        # Look up URL from detail_result (stored as "link")
+        for art in self._detail_result["articles"]:
+            if art["title"] == title:
+                url = art.get("link", "")
+                if url:
+                    webbrowser.open(url)
+                return
+
+    def _on_popup_article_double_click(self, event: tk.Event) -> None:
+        """Popup: double-click article opens URL in browser."""
+        if not self._popup_tree:
+            return
+        item = self._popup_tree.identify_row(event.y)
+        if not item:
+            return
+        values = self._popup_tree.item(item, "values")
+        url = values[4] if len(values) > 4 else ""
+        if url:
+            webbrowser.open(url)
+
+    def _create_article_popup(self) -> None:
+        """Create (or recreate) the article popup Toplevel window."""
+        self._article_popup = tk.Toplevel(self._root)
+        self._article_popup.geometry("800x400")
+        self._article_popup.protocol(
+            "WM_DELETE_WINDOW", self._on_popup_close,
+        )
+
+        self._popup_info_label = ttk.Label(
+            self._article_popup, text="", padding=5,
+        )
+        self._popup_info_label.pack(anchor="w")
+
+        container = ttk.Frame(self._article_popup)
+        container.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+
+        popup_columns = ("#", "Title", "Source", "Date", "URL")
+        self._popup_tree = ttk.Treeview(
+            container, columns=popup_columns, show="headings", height=15,
+        )
+        self._popup_tree.heading("#", text="#")
+        self._popup_tree.heading("Title", text="Title")
+        self._popup_tree.heading("Source", text="Source")
+        self._popup_tree.heading("Date", text="Date")
+        self._popup_tree.heading("URL", text="URL")
+
+        self._popup_tree.column("#", width=35, stretch=False)
+        self._popup_tree.column("Title", width=300, stretch=True)
+        self._popup_tree.column("Source", width=100, stretch=False)
+        self._popup_tree.column("Date", width=90, stretch=False)
+        self._popup_tree.column("URL", width=200, stretch=True)
+
+        popup_sb = ttk.Scrollbar(
+            container, orient="vertical", command=self._popup_tree.yview,
+        )
+        self._popup_tree.configure(yscrollcommand=popup_sb.set)
+        self._popup_tree.pack(side="left", fill="both", expand=True)
+        popup_sb.pack(side="right", fill="y")
+
+        self._popup_tree.bind("<Double-1>", self._on_popup_article_double_click)
+
+    def _on_popup_close(self) -> None:
+        """Handle popup window close."""
+        if self._article_popup:
+            self._article_popup.destroy()
+            self._article_popup = None
+            self._popup_tree = None
+            self._popup_info_label = None
+
+    def _show_articles_for_keyword(self, keyword: str) -> None:
+        """Show popup with articles matching the given keyword."""
+        # Reuse existing popup or create new one
+        if self._article_popup is None or not self._article_popup.winfo_exists():
+            self._create_article_popup()
+
+        self._article_popup.title(f"Articles containing: {keyword}")
+
+        # Clear existing rows
+        for item in self._popup_tree.get_children():
+            self._popup_tree.delete(item)
+
+        articles = self._find_articles_for_keyword(keyword)
+
+        self._popup_info_label.configure(
+            text=f"Keyword: '{keyword}' -- {len(articles)} articles found",
+        )
+
+        for i, art in enumerate(articles, 1):
+            self._popup_tree.insert("", "end", values=(
+                i,
+                art.get("title", ""),
+                art.get("source", ""),
+                art.get("date", ""),
+                art.get("url", ""),
+            ))
+
+        self._article_popup.lift()
+        self._article_popup.focus_force()
+
+    def _find_articles_for_keyword(self, keyword: str) -> list[dict]:
+        """Find articles containing the given keyword.
+
+        Priority:
+        1. Detail result with precomputed counts
+        2. Naver articles (substring search)
+        3. General crawl pages (substring search)
+        """
+        kw_lower = keyword.lower()
+
+        # Path 1: Detail result exists and keyword is in the analysis
+        if self._detail_result and keyword in self._detail_result.get("keywords", []):
+            matches = []
+            for art in self._detail_result["articles"]:
+                if art["counts"].get(keyword, 0) > 0:
+                    # Look up source/date from _naver_articles by link
+                    link = art.get("link", "")
+                    source, date = "", ""
+                    for na in self._naver_articles:
+                        if na.link == link:
+                            source, date = na.source, na.date
+                            break
+                    matches.append({
+                        "title": art["title"],
+                        "source": source,
+                        "date": date,
+                        "url": link,
+                    })
+            return matches
+
+        # Path 2: Naver articles exist — substring search
+        if self._naver_articles:
+            matches = []
+            for art in self._naver_articles:
+                text = f"{art.title} {art.description} {art.body or ''}".lower()
+                if kw_lower in text:
+                    matches.append({
+                        "title": art.title,
+                        "source": art.source,
+                        "date": art.date,
+                        "url": art.link,
+                    })
+            return matches
+
+        # Path 3: General crawl pages
+        if self._crawl_result and self._crawl_result.pages:
+            matches = []
+            for page in self._crawl_result.pages:
+                text = (page.full_text or "").lower()
+                if kw_lower in text:
+                    matches.append({
+                        "title": page.title or "(no title)",
+                        "source": "",
+                        "date": "",
+                        "url": page.url,
+                    })
+            return matches
+
+        return []
 
     def _export_detail_csv(self) -> None:
         if not self._detail_result:
