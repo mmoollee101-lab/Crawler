@@ -25,7 +25,7 @@ from .google_news import GoogleNewsCrawler
 from .naver_news import NaverNewsCrawler
 from .storage import Storage
 
-_STORAGE = Storage("output")
+_STORAGE = Storage()
 
 
 class CrawlerGUI:
@@ -271,14 +271,21 @@ class CrawlerGUI:
 
         ttk.Label(preset_row, text="Preset:").pack(side="left")
         self._detail_preset_var = tk.StringVar(value="Companies")
-        preset_combo = ttk.Combobox(
+        self._preset_combo = ttk.Combobox(
             preset_row, textvariable=self._detail_preset_var,
             values=["Companies"], state="readonly", width=15,
         )
-        preset_combo.pack(side="left", padx=5)
+        self._preset_combo.pack(side="left", padx=5)
         ttk.Button(
-            preset_row, text="Load Preset", command=self._load_detail_preset,
-        ).pack(side="left", padx=5)
+            preset_row, text="Load", command=self._load_detail_preset,
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            preset_row, text="Save Preset", command=self._save_detail_preset,
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            preset_row, text="Delete Preset", command=self._delete_detail_preset,
+        ).pack(side="left", padx=2)
+        self._refresh_preset_list()
 
         kw_input_row = ttk.Frame(kw_settings)
         kw_input_row.pack(fill="x", pady=2)
@@ -727,16 +734,16 @@ class CrawlerGUI:
             filtered_keywords,
         )
         self._graph_canvas = viz.embed_in_tkinter(fig, self._graph_container)
-        self._graph_canvas.mpl_connect("pick_event", self._on_graph_pick)
         self._graph_canvas.mpl_connect("button_press_event", self._on_graph_button_press)
 
     def _save_graph(self) -> None:
         if not self._graph_canvas:
             messagebox.showinfo("No Graph", "Generate a graph first.")
             return
-        os.makedirs("output", exist_ok=True)
+        out = _STORAGE._output_dir
+        os.makedirs(out, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join("output", f"graph_{ts}.png")
+        path = os.path.join(out, f"graph_{ts}.png")
         self._graph_canvas.figure.savefig(path, dpi=150, bbox_inches="tight")
         self._status_var.set(f"Graph saved: {path}")
         messagebox.showinfo("Saved", f"Graph saved to {path}")
@@ -811,7 +818,7 @@ class CrawlerGUI:
         if not messagebox.askyesno("Clear History", "Delete all crawl history?"):
             return
         import json
-        path = os.path.join("output", "history.json")
+        path = os.path.join(_STORAGE._output_dir, "history.json")
         if os.path.exists(path):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump([], f)
@@ -820,8 +827,63 @@ class CrawlerGUI:
 
     # ── Detail Analysis tab ──────────────────────────────────────
 
+    def _refresh_preset_list(self) -> None:
+        """Refresh the preset combobox with built-in + user presets."""
+        user_presets = _STORAGE.load_presets()
+        names = ["Companies"] + [n for n in sorted(user_presets) if n != "Companies"]
+        self._preset_combo["values"] = names
+
     def _load_detail_preset(self) -> None:
-        self._detail_kw_var.set(", ".join(DEFAULT_COMPANIES))
+        name = self._detail_preset_var.get()
+        if name == "Companies":
+            self._detail_kw_var.set(", ".join(DEFAULT_COMPANIES))
+            return
+        user_presets = _STORAGE.load_presets()
+        keywords = user_presets.get(name)
+        if keywords:
+            self._detail_kw_var.set(", ".join(keywords))
+        else:
+            messagebox.showwarning("Preset Not Found", f"Preset '{name}' not found.")
+
+    def _save_detail_preset(self) -> None:
+        """Save current keywords as a named preset."""
+        keywords = self._parse_detail_keywords()
+        if not keywords:
+            messagebox.showwarning("No Keywords", "Enter at least one keyword to save.")
+            return
+        from tkinter import simpledialog
+        name = simpledialog.askstring(
+            "Save Preset", "Preset name:", parent=self._root,
+        )
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name == "Companies":
+            messagebox.showwarning(
+                "Reserved Name", "'Companies' is a built-in preset and cannot be overwritten.",
+            )
+            return
+        _STORAGE.save_preset(name, keywords)
+        self._refresh_preset_list()
+        self._detail_preset_var.set(name)
+        self._status_var.set(f"Preset '{name}' saved.")
+
+    def _delete_detail_preset(self) -> None:
+        """Delete the selected preset."""
+        name = self._detail_preset_var.get()
+        if name == "Companies":
+            messagebox.showwarning(
+                "Cannot Delete", "'Companies' is a built-in preset and cannot be deleted.",
+            )
+            return
+        if not messagebox.askyesno("Delete Preset", f"Delete preset '{name}'?"):
+            return
+        if _STORAGE.delete_preset(name):
+            self._refresh_preset_list()
+            self._detail_preset_var.set("Companies")
+            self._status_var.set(f"Preset '{name}' deleted.")
+        else:
+            messagebox.showwarning("Not Found", f"Preset '{name}' not found.")
 
     def _parse_detail_keywords(self) -> list[str]:
         raw = self._detail_kw_var.get().strip()
@@ -997,15 +1059,7 @@ class CrawlerGUI:
         viz = KeywordVisualizer()
         fig = viz.create_detail_bar_chart(result["totals"])
         self._graph_canvas = viz.embed_in_tkinter(fig, self._graph_container)
-        self._graph_canvas.mpl_connect("pick_event", self._on_graph_pick)
-
-    # ── Keyword-Article mapping & URL open ─────────────────────
-
-    def _on_graph_pick(self, event) -> None:
-        """Graph tab: click a bar to show articles for that keyword."""
-        keyword = getattr(event.artist, "_keyword", None)
-        if keyword:
-            self._show_articles_for_keyword(keyword)
+        self._graph_canvas.mpl_connect("button_press_event", self._on_graph_button_press)
 
     def _on_article_double_click(self, event: tk.Event) -> None:
         """Headlines tab: double-click opens article URL in browser."""
@@ -1103,8 +1157,8 @@ class CrawlerGUI:
         menu.tk_popup(event.x_root, event.y_root)
 
     def _on_graph_button_press(self, event) -> None:
-        """Graph tab: right-click (button 3) a bar to hide that keyword."""
-        if event.button != 3 or not self._graph_canvas:
+        """Graph tab: double-click (button 1) opens articles, right-click (button 3) hides."""
+        if not self._graph_canvas:
             return
 
         ax = self._graph_canvas.figure.axes[0] if self._graph_canvas.figure.axes else None
@@ -1121,24 +1175,30 @@ class CrawlerGUI:
         if not keyword:
             return
 
-        # Get screen coordinates from the tkinter widget
-        widget = self._graph_canvas.get_tk_widget()
-        x_root = widget.winfo_rootx() + int(event.x)
-        y_root = widget.winfo_rooty() + widget.winfo_height() - int(event.y)
+        # Double-click left button → show articles
+        if event.dblclick and event.button == 1:
+            self._show_articles_for_keyword(keyword)
+            return
 
-        menu = tk.Menu(self._root, tearoff=0)
-        menu.add_command(
-            label=f"Hide '{keyword}'",
-            command=lambda: self._hide_keyword(keyword),
-        )
-        if self._hidden_keywords:
+        # Right-click → hide keyword menu
+        if event.button == 3:
+            widget = self._graph_canvas.get_tk_widget()
+            x_root = widget.winfo_rootx() + int(event.x)
+            y_root = widget.winfo_rooty() + widget.winfo_height() - int(event.y)
+
+            menu = tk.Menu(self._root, tearoff=0)
             menu.add_command(
-                label=f"Show All Hidden ({len(self._hidden_keywords)})",
-                command=self._show_all_keywords,
+                label=f"Hide '{keyword}'",
+                command=lambda: self._hide_keyword(keyword),
             )
-        menu.add_separator()
-        menu.add_command(label="Cancel")
-        menu.tk_popup(x_root, y_root)
+            if self._hidden_keywords:
+                menu.add_command(
+                    label=f"Show All Hidden ({len(self._hidden_keywords)})",
+                    command=self._show_all_keywords,
+                )
+            menu.add_separator()
+            menu.add_command(label="Cancel")
+            menu.tk_popup(x_root, y_root)
 
     def _hide_keyword(self, keyword: str) -> None:
         """Add keyword to hidden set and refresh views."""

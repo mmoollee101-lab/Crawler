@@ -117,7 +117,10 @@ class KeywordAnalyzer:
                 continue
             unique = set(doc_tokens)
             unique.discard(query_lower)
-            for token in unique:
+            for token in list(unique):
+                if self._is_query_subtoken(token, query_lower):
+                    unique.discard(token)
+                    continue
                 co_occurrence[token] += 1
 
         # TF-IDF scores
@@ -125,6 +128,8 @@ class KeywordAnalyzer:
         tfidf_scores: dict[str, float] = {}
         for token, tf_val in global_tf.items():
             if token == query_lower:
+                continue
+            if self._is_query_subtoken(token, query_lower):
                 continue
             idf = math.log((n_docs + 1) / (df.get(token, 0) + 1)) + 1
             tfidf_scores[token] = tf_val * idf
@@ -166,6 +171,8 @@ class KeywordAnalyzer:
             for bg in bigrams:
                 if bg in top_kw_set or bg == query_lower:
                     continue
+                if self._is_query_subtoken(bg, query_lower):
+                    continue
                 # Count bigram frequency across documents
                 bg_freq = sum(
                     1 for doc in documents
@@ -189,6 +196,19 @@ class KeywordAnalyzer:
             total_pages_analyzed=len(pages),
             pages_containing_query=pages_with_query,
         )
+
+    @staticmethod
+    def _is_query_subtoken(token: str, query_lower: str) -> bool:
+        """Return True if *token* is a substring of the query or vice-versa.
+
+        Ignores matches where the overlapping part is 2 chars or fewer
+        to avoid filtering out unrelated short coincidences.
+        """
+        if token in query_lower and len(token) > 2:
+            return True
+        if query_lower in token and len(query_lower) > 2:
+            return True
+        return False
 
     def _tokenize(self, text: str) -> List[str]:
         """Dispatch to kiwi or regex tokenizer."""

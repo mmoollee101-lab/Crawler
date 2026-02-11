@@ -6,19 +6,36 @@ import csv
 import json
 import logging
 import os
+import shutil
 from datetime import datetime
 
 from .models import CrawlResult, KeywordResult
 
 logger = logging.getLogger(__name__)
 
+_MIGRATE_FILES = ("history.json", "presets.json")
+
+
+def _get_user_data_dir() -> str:
+    """Return user-local data directory for KeywordCrawler.
+
+    Windows: %LOCALAPPDATA%/KeywordCrawler/
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        base = os.path.expanduser("~")
+    return os.path.join(base, "KeywordCrawler")
+
 
 class Storage:
     """Persist crawl results to disk."""
 
-    def __init__(self, output_dir: str) -> None:
+    def __init__(self, output_dir: str | None = None) -> None:
+        if output_dir is None:
+            output_dir = _get_user_data_dir()
         self._output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
+        self._migrate_legacy_data()
 
     def save_json(self, result: CrawlResult) -> str:
         path = self._make_path("json")
@@ -142,3 +159,54 @@ class Storage:
                 return json.load(f)
         except (json.JSONDecodeError, ValueError):
             return []
+
+    # ── Legacy data migration ────────────────────────────────
+
+    def _migrate_legacy_data(self) -> None:
+        """Copy history/presets from old ./output/ folder if they exist."""
+        legacy_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
+        if not os.path.isdir(legacy_dir):
+            return
+        if os.path.normpath(legacy_dir) == os.path.normpath(self._output_dir):
+            return
+        for fname in _MIGRATE_FILES:
+            src = os.path.join(legacy_dir, fname)
+            dst = os.path.join(self._output_dir, fname)
+            if os.path.exists(src) and not os.path.exists(dst):
+                shutil.copy2(src, dst)
+                logger.info("Migrated %s → %s", src, dst)
+
+    # ── Preset CRUD ──────────────────────────────────────────
+
+    def _presets_path(self) -> str:
+        return os.path.join(self._output_dir, "presets.json")
+
+    def load_presets(self) -> dict[str, list[str]]:
+        """Load user-defined presets from presets.json."""
+        path = self._presets_path()
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    def save_preset(self, name: str, keywords: list[str]) -> None:
+        """Save a preset to presets.json."""
+        presets = self.load_presets()
+        presets[name] = keywords
+        with open(self._presets_path(), "w", encoding="utf-8") as f:
+            json.dump(presets, f, ensure_ascii=False, indent=2)
+        logger.info("Saved preset '%s' (%d keywords)", name, len(keywords))
+
+    def delete_preset(self, name: str) -> bool:
+        """Delete a preset from presets.json. Returns True if deleted."""
+        presets = self.load_presets()
+        if name not in presets:
+            return False
+        del presets[name]
+        with open(self._presets_path(), "w", encoding="utf-8") as f:
+            json.dump(presets, f, ensure_ascii=False, indent=2)
+        logger.info("Deleted preset '%s'", name)
+        return True
