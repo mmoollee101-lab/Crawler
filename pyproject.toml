@@ -13,6 +13,9 @@ dependencies = [
     "matplotlib>=3.7.0",
 ]
 
+[project.optional-dependencies]
+nlp = ["kiwipiepy>=0.18.0"]
+
 [project.scripts]
 crawler = "crawler.cli:main"
 crawler-gui = "crawler.gui:main"

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 import warnings
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Callable, List, Optional
 from urllib.parse import unquote, urlparse
@@ -25,15 +27,38 @@ _SEARCH_URL = "https://www.google.com/search"
 _RSS_URL = "https://news.google.com/rss/search"
 _PAGE_SIZE = 10
 
+_KO_RE = re.compile(r"[가-힣]")
+
+
+def _detect_locale(keyword: str) -> tuple[str, str, str]:
+    """Detect locale from keyword language.
+
+    Returns (hl, gl, ceid) tuple.
+    Korean characters present → Korean locale, otherwise English/US.
+    """
+    if _KO_RE.search(keyword):
+        return ("ko", "KR", "KR:ko")
+    return ("en", "US", "US:en")
+
 _HEADERS_HTML = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://www.google.com/",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Cookies to bypass Google consent/CAPTCHA screens
+_COOKIES = {
+    "CONSENT": "PENDING+987",
+    "SOCS": "CAESHAgBEhJnd3NfMjAyNDAxMTAtMF9SQzIaAmVuIAEaBgiA_LyuBg",
 }
 
 _HEADERS_RSS = {
@@ -105,6 +130,7 @@ class GoogleNewsCrawler:
         self._delay = delay
         self._progress_callback = progress_callback
         self._cancel_event = cancel_event
+        self._hl, self._gl, self._ceid = _detect_locale(keyword)
 
     def crawl(self) -> List[NewsArticle]:
         """Try HTML scraping, fall back to RSS if blocked."""
@@ -127,6 +153,7 @@ class GoogleNewsCrawler:
         """Scrape Google Search News tab. Returns None if blocked."""
         session = requests.Session()
         session.headers.update(_HEADERS_HTML)
+        session.cookies.update(_COOKIES)
 
         articles: List[NewsArticle] = []
         start = 0
@@ -143,8 +170,8 @@ class GoogleNewsCrawler:
             params = {
                 "q": self._keyword,
                 "tbm": "nws",
-                "hl": "ko",
-                "gl": "KR",
+                "hl": self._hl,
+                "gl": self._gl,
                 "num": str(_PAGE_SIZE),
                 "start": str(start),
                 "tbs": tbs,
@@ -189,8 +216,9 @@ class GoogleNewsCrawler:
     def _fetch_html(
         self, session: requests.Session, params: dict,
     ) -> Optional[requests.Response]:
-        """Fetch with single retry on 429. Returns None if blocked."""
-        for attempt in range(2):
+        """Fetch with retries on 429. Returns None if blocked."""
+        _RETRY_DELAYS = [3, 5, 8]
+        for attempt in range(len(_RETRY_DELAYS) + 1):
             try:
                 resp = session.get(_SEARCH_URL, params=params, timeout=15)
 
@@ -199,9 +227,11 @@ class GoogleNewsCrawler:
                     return resp
 
                 if resp.status_code == 429:
-                    if attempt == 0:
-                        logger.warning("Google 429, retrying in 3s...")
-                        time.sleep(3)
+                    if attempt < len(_RETRY_DELAYS):
+                        delay = _RETRY_DELAYS[attempt]
+                        logger.warning("Google 429, retrying in %ds... (%d/%d)",
+                                       delay, attempt + 1, len(_RETRY_DELAYS))
+                        time.sleep(delay)
                         continue
                     logger.warning("Google 429 persists, switching to RSS.")
                     return None
@@ -305,70 +335,113 @@ class GoogleNewsCrawler:
     # ── Strategy 2: RSS feed (fallback) ───────────────────────
 
     def _crawl_rss(self) -> List[NewsArticle]:
-        """Fetch from Google News RSS, filter dates in Python."""
+        """Fetch from Google News RSS with weekly time-window splitting.
+
+        Google News RSS returns a limited number of results per query.
+        By splitting the date range into weekly windows and adding
+        ``after:/before:`` operators, we can collect more articles.
+        """
         session = requests.Session()
         session.headers.update(_HEADERS_RSS)
 
         dt_from = _parse_date_str(self._start_date)
         dt_to = _parse_date_str(self._end_date) + timedelta(days=1)
 
-        params = {"q": self._keyword, "hl": "ko", "gl": "KR", "ceid": "KR:ko"}
+        # Build weekly windows (newest first for user feedback)
+        windows: list[tuple[datetime, datetime]] = []
+        cursor = dt_to
+        while cursor > dt_from:
+            win_start = max(cursor - timedelta(days=7), dt_from)
+            windows.append((win_start, cursor))
+            cursor = win_start
 
-        try:
-            resp = session.get(_RSS_URL, params=params, timeout=15)
-            resp.raise_for_status()
-            resp.encoding = "utf-8"
-        except requests.RequestException as e:
-            logger.warning("Google News RSS failed: %s", e)
-            session.close()
-            return []
+        seen_urls: set[str] = set()
+        all_items: list[tuple] = []  # (item, pub_dt)
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        items = soup.find_all("item")
-        session.close()
-
-        if not items:
-            return []
-
-        # Filter by date range
-        filtered = []
-        for item in items:
-            pd_tag = item.find("pubdate")
-            if not pd_tag:
-                continue
-            pub_dt = _parse_pub_date_dt(pd_tag.get_text())
-            if pub_dt and dt_from <= pub_dt < dt_to:
-                filtered.append((item, pub_dt))
-
-        if not filtered:
-            return []
-
-        articles: List[NewsArticle] = []
-        total = min(len(filtered), self._max_results)
-
-        for i, (item, pub_dt) in enumerate(filtered[:total]):
+        for win_idx, (ws, we) in enumerate(windows):
             if self._cancel_event and self._cancel_event.is_set():
                 break
+            if len(all_items) >= self._max_results:
+                break
 
-            article = self._parse_rss_item(item, pub_dt)
-            if article:
-                articles.append(article)
+            # Use after:/before: date operators in the query
+            q = (
+                f"{self._keyword} "
+                f"after:{ws.strftime('%Y-%m-%d')} "
+                f"before:{we.strftime('%Y-%m-%d')}"
+            )
+            params = {"q": q, "hl": self._hl, "gl": self._gl, "ceid": self._ceid}
+
+            try:
+                resp = session.get(_RSS_URL, params=params, timeout=15)
+                resp.raise_for_status()
+                resp.encoding = "utf-8"
+            except requests.RequestException as e:
+                logger.warning("Google News RSS failed (window %d): %s", win_idx, e)
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            items = soup.find_all("item")
+
+            for item in items:
+                pd_tag = item.find("pubdate")
+                if not pd_tag:
+                    continue
+                pub_dt = _parse_pub_date_dt(pd_tag.get_text())
+                if not pub_dt or not (dt_from <= pub_dt < dt_to):
+                    continue
+                # Deduplicate by title text
+                title_tag = item.find("title")
+                title_text = title_tag.get_text(strip=True) if title_tag else ""
+                if title_text in seen_urls:
+                    continue
+                seen_urls.add(title_text)
+                all_items.append((item, pub_dt))
 
             if self._progress_callback:
                 self._progress_callback(
-                    i + 1, total,
-                    article.title if article else "",
+                    len(all_items), self._max_results,
+                    f"RSS window {win_idx + 1}/{len(windows)}",
                 )
 
-            if i < total - 1 and self._delay > 0:
-                time.sleep(self._delay * 0.3)
+            if win_idx < len(windows) - 1:
+                time.sleep(self._delay * 0.5)
+
+        session.close()
+
+        if not all_items:
+            return []
+
+        # Sort by date descending (newest first)
+        all_items.sort(key=lambda x: x[1], reverse=True)
+
+        # Phase 1: Parse all items quickly (no URL decoding yet)
+        articles: List[NewsArticle] = []
+        total = min(len(all_items), self._max_results)
+
+        for item, pub_dt in all_items[:total]:
+            article = self._parse_rss_item_fast(item, pub_dt)
+            if article:
+                articles.append(article)
+
+        if not articles:
+            return []
+
+        if self._progress_callback:
+            self._progress_callback(
+                len(articles), len(articles),
+                f"Decoding {len(articles)} URLs...",
+            )
+
+        # Phase 2: Batch-decode Google URLs in parallel
+        self._batch_decode_urls(articles)
 
         return articles
 
-    def _parse_rss_item(
+    def _parse_rss_item_fast(
         self, item, pub_dt: datetime,
     ) -> Optional[NewsArticle]:
-        """Parse a single RSS <item>."""
+        """Parse a single RSS <item> without URL decoding (fast)."""
         title_tag = item.find("title")
         raw_title = title_tag.get_text(strip=True) if title_tag else ""
 
@@ -400,25 +473,61 @@ class GoogleNewsCrawler:
         if link_tag and link_tag.next_sibling:
             google_link = str(link_tag.next_sibling).strip()
 
-        real_url = self._decode_article_url(google_link)
-
         if not title:
             return None
 
         return NewsArticle(
-            title=title, link=real_url, source=source,
+            title=title, link=google_link, source=source,
             date=date, description=description,
         )
 
-    @staticmethod
-    def _decode_article_url(google_url: str) -> str:
-        """Decode Google News article URL to the real source URL."""
-        if not google_url:
-            return ""
-        try:
-            result = new_decoderv1(google_url)
-            if result.get("status"):
-                return result["decoded_url"]
-        except Exception as e:
-            logger.debug("URL decode failed: %s", e)
-        return google_url
+    def _batch_decode_urls(self, articles: List[NewsArticle]) -> None:
+        """Decode Google News URLs to real source URLs in parallel."""
+        # Build index of articles needing decode
+        to_decode: list[tuple[int, str]] = []
+        for i, art in enumerate(articles):
+            if art.link and "news.google.com" in art.link:
+                to_decode.append((i, art.link))
+
+        if not to_decode:
+            return
+
+        workers = min(8, len(to_decode))
+        decoded: dict[int, str] = {}
+
+        def _decode(idx: int, url: str) -> tuple[int, str]:
+            try:
+                result = new_decoderv1(url)
+                if result.get("status"):
+                    return (idx, result["decoded_url"])
+            except Exception:
+                pass
+            return (idx, url)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_decode, idx, url): idx
+                for idx, url in to_decode
+            }
+            done_count = 0
+            for future in as_completed(futures):
+                if self._cancel_event and self._cancel_event.is_set():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                idx, real_url = future.result()
+                decoded[idx] = real_url
+                done_count += 1
+                if self._progress_callback and done_count % 10 == 0:
+                    self._progress_callback(
+                        done_count, len(to_decode),
+                        f"Decoded {done_count}/{len(to_decode)} URLs",
+                    )
+
+        for idx, real_url in decoded.items():
+            articles[idx] = NewsArticle(
+                title=articles[idx].title,
+                link=real_url,
+                source=articles[idx].source,
+                date=articles[idx].date,
+                description=articles[idx].description,
+            )

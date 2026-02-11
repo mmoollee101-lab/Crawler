@@ -110,7 +110,97 @@ class NaverNewsCrawler:
         self._session.close()
         return articles[: self._max_results]
 
+    # ── URL validation ──────────────────────────────────────────
+
+    @staticmethod
+    def _is_valid_article_url(href: str) -> bool:
+        """Allow Naver News article URLs but block other naver.com internal links."""
+        if not href.startswith("http"):
+            return False
+        parsed = urlparse(href)
+        host = parsed.hostname or ""
+        # Allow Naver News article pages
+        if host in ("n.news.naver.com", "news.naver.com"):
+            return "/article/" in parsed.path or "/mnews/article/" in parsed.path
+        # Allow Naver media press pages as source links (not articles)
+        if "naver.com" in host:
+            return False
+        # External URLs are fine
+        if parsed.path in ("", "/"):
+            return False
+        return True
+
+    # ── Parsing: 2-step strategy ─────────────────────────────────
+
     def _parse_results(self, html: str) -> List[NewsArticle]:
+        """Try structured CSS selector parsing first, fall back to generic <a> scan."""
+        articles = self._parse_results_structured(html)
+        if articles:
+            return articles
+        return self._parse_results_fallback(html)
+
+    def _parse_results_structured(self, html: str) -> List[NewsArticle]:
+        """Parse using Naver News search result CSS selectors."""
+        soup = BeautifulSoup(html, "html.parser")
+        container = soup.select_one(".list_news")
+        if not container:
+            return []
+
+        articles: List[NewsArticle] = []
+        seen_urls: set[str] = set()
+
+        for bx in container.select(".bx"):
+            # Title link
+            title_tag = bx.select_one("a.news_tit")
+            if not title_tag:
+                continue
+            href = title_tag.get("href", "")
+            title = title_tag.get_text(strip=True)
+            if not href or not title or href in seen_urls:
+                continue
+            if not self._is_valid_article_url(href) and "naver.com" in href:
+                continue
+            seen_urls.add(href)
+
+            # Press name
+            source = ""
+            press_tag = bx.select_one(".info.press")
+            if press_tag:
+                source = press_tag.get_text(strip=True)
+
+            # Date
+            date = ""
+            for span in bx.select("span.info"):
+                st = span.get_text(strip=True)
+                if _DATE_RE.search(st):
+                    date = st
+                    break
+
+            # Description
+            description = ""
+            desc_tag = bx.select_one(".news_dsc")
+            if desc_tag:
+                # The actual text is often inside a nested <a> tag
+                desc_link = desc_tag.select_one("a.api_txt_lines")
+                if desc_link:
+                    description = desc_link.get_text(strip=True)
+                else:
+                    description = desc_tag.get_text(strip=True)
+
+            articles.append(
+                NewsArticle(
+                    title=title,
+                    link=href,
+                    source=source,
+                    date=date,
+                    description=description,
+                )
+            )
+
+        return articles
+
+    def _parse_results_fallback(self, html: str) -> List[NewsArticle]:
+        """Fallback: generic <a> tag scan with improved URL filtering."""
         soup = BeautifulSoup(html, "html.parser")
         container = soup.select_one(".list_news")
         if not container:
@@ -122,13 +212,10 @@ class NaverNewsCrawler:
         for a_tag in container.find_all("a", href=True):
             href = a_tag["href"]
             text = a_tag.get_text(strip=True)
-            parsed = urlparse(href)
 
-            # Filter: external article link with meaningful title text
+            # Filter: valid article URL with meaningful title text
             if (
-                not href.startswith("http")
-                or "naver.com" in href
-                or parsed.path in ("", "/")
+                not self._is_valid_article_url(href)
                 or href in seen_urls
                 or not (10 < len(text) < 100)
                 or text.startswith("http")

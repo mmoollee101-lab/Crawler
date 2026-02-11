@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import queue
 import threading
@@ -114,9 +115,9 @@ class CrawlerGUI:
 
         ttk.Label(row0, text="Keyword:").pack(side="left")
         self._keyword_var = tk.StringVar()
-        ttk.Entry(row0, textvariable=self._keyword_var, width=20).pack(
-            side="left", padx=(5, 0), fill="x", expand=True,
-        )
+        kw_entry = ttk.Entry(row0, textvariable=self._keyword_var, width=20)
+        kw_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
+        kw_entry.bind("<Return>", lambda e: self._on_start())
 
         # Dynamic container — holds mode-specific rows (stays packed, children swap)
         self._dynamic = ttk.Frame(frame)
@@ -131,7 +132,10 @@ class CrawlerGUI:
         ttk.Label(self._row_naver, text="Date From:").pack(side="left")
         self._date_from_var = tk.StringVar(value=week_ago.strftime("%Y.%m.%d"))
         ttk.Entry(self._row_naver, textvariable=self._date_from_var, width=12).pack(
-            side="left", padx=(5, 15),
+            side="left", padx=(5, 0),
+        )
+        ttk.Label(self._row_naver, text="(YYYY.MM.DD)", foreground="gray").pack(
+            side="left", padx=(2, 15),
         )
 
         ttk.Label(self._row_naver, text="Date To:").pack(side="left")
@@ -139,6 +143,16 @@ class CrawlerGUI:
         ttk.Entry(self._row_naver, textvariable=self._date_to_var, width=12).pack(
             side="left", padx=(5, 0),
         )
+        ttk.Label(self._row_naver, text="(YYYY.MM.DD)", foreground="gray").pack(
+            side="left", padx=(2, 10),
+        )
+
+        # Date preset buttons
+        for label, days in [("1주", 7), ("1개월", 30), ("3개월", 90)]:
+            ttk.Button(
+                self._row_naver, text=label, width=5,
+                command=lambda d=days: self._set_date_preset(d),
+            ).pack(side="left", padx=2)
 
         # Row: Buttons + progress
         row4 = ttk.Frame(frame)
@@ -411,10 +425,49 @@ class CrawlerGUI:
 
     # ── Actions ──────────────────────────────────────────────────
 
+    def _set_date_preset(self, days: int) -> None:
+        """Set date range to today minus *days* through today."""
+        today = datetime.now()
+        self._date_to_var.set(today.strftime("%Y.%m.%d"))
+        self._date_from_var.set((today - timedelta(days=days)).strftime("%Y.%m.%d"))
+
+    def _validate_dates(self) -> bool:
+        """Validate date format, real date, and range order. Returns True if OK."""
+        date_re = re.compile(r"^\d{4}\.\d{2}\.\d{2}$")
+        for label, var in [("Date From", self._date_from_var), ("Date To", self._date_to_var)]:
+            val = var.get().strip()
+            if not date_re.match(val):
+                messagebox.showwarning(
+                    "Invalid Date",
+                    f"{label} must be in YYYY.MM.DD format.\nCurrent value: {val}",
+                )
+                return False
+            try:
+                datetime.strptime(val, "%Y.%m.%d")
+            except ValueError:
+                messagebox.showwarning(
+                    "Invalid Date",
+                    f"{label} is not a valid date: {val}",
+                )
+                return False
+
+        d_from = datetime.strptime(self._date_from_var.get().strip(), "%Y.%m.%d")
+        d_to = datetime.strptime(self._date_to_var.get().strip(), "%Y.%m.%d")
+        if d_from > d_to:
+            messagebox.showwarning(
+                "Invalid Date Range",
+                "Date From must be earlier than or equal to Date To.",
+            )
+            return False
+        return True
+
     def _on_start(self) -> None:
         keyword = self._keyword_var.get().strip()
         if not keyword:
             messagebox.showwarning("Input Required", "Please enter a keyword.")
+            return
+
+        if not self._validate_dates():
             return
 
         mode = self._mode_var.get()
